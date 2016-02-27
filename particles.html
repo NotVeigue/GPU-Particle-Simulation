@@ -1,0 +1,946 @@
+<html>
+<head>
+
+<style>
+	body { 
+		background: #111;
+	}
+	.canvas-holder {
+		position: fixed;
+	    width: 100%;
+	    left: 50%;
+	    margin-left: -540px;
+	}
+	#fps {
+		color: #cccccc;
+	}
+</style>
+
+<script src='three/three.min.js' type='text/javascript'></script>
+<script src='jquery-1.11.3.min.js' type='text/javascript'></script>
+<script src='dat.gui.min.js' type='text/javascript'></script>
+<script type='x-shader/x-vertex' id="blur">
+	varying vec2 vUv;
+
+	uniform sampler2D tex;
+	uniform vec2 size;
+	uniform float kernelSize;
+	uniform float blurStrength;
+	uniform float blurScale;
+	uniform int direction; // 0 = Horizontal, 1 = Vertical
+
+	float Gaussian(float x, float deviation)
+	{
+		return (1.0 / sqrt(2.0 * 3.141592 * deviation)) * exp(-((x * x)/(2.0 * deviation)));
+	}
+
+	float cubicPulse( float c, float w, float x )
+	{
+	    x = abs(x - c);
+	    if( x > w ) 
+	    	return 0.0;
+	    x /= w;
+	    return 1.0 - x * x * (3.0 - 2.0 * x);
+	}
+
+	void main()
+	{
+		vec4 color = vec4(0.0, 0.0, 0.0, 0.0);
+		vec4 texcolor = vec4(0.0, 0.0, 0.0, 0.0);
+		vec2 texcoord = vUv;
+		
+		float hblur = kernelSize * 0.5;
+		float deviation = pow(hblur * 0.35, 2.0);
+		float strength = 1.0 - blurStrength;
+		
+		for(float i = 0.0; i > -1.0; i++)
+		{
+			if(i >= kernelSize)
+				break;
+			
+			float offset = i - hblur;
+			vec2 dir = (direction == 1) ? vec2(0.0, offset * size.y * blurScale) : vec2(offset * size.x * blurScale, 0.0);
+			texcolor = texture2D(tex, texcoord + dir)  * Gaussian(offset * strength, deviation); // * cubicPulse(0.0, hblur, offset * strength);
+			color += texcolor;
+		}
+
+		gl_FragColor = clamp(color, 0.0, 1.0);
+	}
+</script>
+<script type='x-shader/x-fragment' id='pVertex'>
+	varying vec4 color;
+
+	uniform sampler2D posTex;
+	uniform float psize;
+	uniform float simulationSize;
+
+	void main()
+	{
+		color = texture2D(posTex, position.xy);
+		vec3 pos = (color.xyz * 2.0 - 1.0) * simulationSize;
+
+		gl_PointSize = psize;
+		gl_Position = projectionMatrix * modelViewMatrix * vec4( pos, 1.0);
+	}
+
+</script>
+<script type='x-shader/x-fragment' id='pFragment'>
+	varying vec4 color;
+
+	void main()
+	{
+		gl_FragColor = vec4(color.xyz, 1.0 - color.w);
+	}
+</script>
+<script type='x-shader/x-fragment' id='simVertex'>
+	varying vec2 vUv;
+
+	void main()
+	{
+		vUv = uv;
+		gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0);
+	}
+</script>
+<script type='x-shader/x-fragment' id='posFragment'>
+	varying vec2 vUv;
+
+	uniform sampler2D posTex;
+	uniform sampler2D velTex;
+	uniform sampler2D gravTex;
+	uniform sampler2D origTex;
+	uniform float dt;
+	uniform float simulationSize;
+	uniform float speed;
+	uniform float gravSpeed;
+	uniform int containment;
+
+	void main()
+	{
+		//vec3 position = (texture2D(posTex, vUv).xyz * 2.0 - 1.0) * simulationSize;
+		vec3 position = texture2D(posTex, vUv).xyz * simulationSize;
+		vec4 vdata = texture2D(velTex, vUv);
+		vec3 velocity = vdata.xyz * 2.0 - 1.0;
+		float t = vdata.w;
+
+		if(t == 0.0)
+		{
+			position = texture2D(origTex, vUv).xyz;
+			gl_FragColor = vec4(position, 0.0);
+			return;
+		}
+
+		vec3 gravity = texture2D(gravTex, vUv).xyz * 2.0 - 1.0;
+
+		position += velocity * speed * dt;
+		position += gravity * gravSpeed * dt;
+
+		// Cube
+		if(containment == 1)
+		{
+			vec3 newPosition = clamp(position, 0.0, simulationSize);
+			if(newPosition != position)
+			{
+				vec3 diff = newPosition - position;
+				position += normalize(diff) * min(length(diff), 0.5);
+			}
+		}
+		// Sphere
+		else if(containment == 2)
+		{
+			float hss = simulationSize * 0.5;
+			vec3 pc = position - hss;
+			if(dot(pc, pc) > hss * hss)
+			{
+				vec3 newPosition = vec3(hss) + normalize(pc) * (hss);
+				vec3 diff = newPosition - position;
+				position += normalize(diff) * min(length(diff), 0.5);
+			}
+		}
+		
+		position /= simulationSize;
+		//position = (position + 1.0) * 0.5;
+
+		gl_FragColor = vec4(position, t);
+	}
+</script>
+<script type='x-shader/x-fragment' id='gravFragment'>
+	varying vec2 vUv;
+
+	uniform sampler2D gravTex;
+	uniform sampler2D posTex;
+	uniform float dt;
+	uniform float simulationSize;
+	uniform float degradation;
+	uniform float gravForce;
+	uniform float gravSpeed;
+	uniform float gravDist;
+	uniform int mouseDown;
+	uniform vec3 gravPos;
+
+	void main()
+	{
+		vec4 posData = texture2D(posTex, vUv);
+		if(posData.w == 0.0)
+		{
+			gl_FragColor = vec4(0.5, 0.5, 0.5, 1.0);
+			return;
+		}
+
+		vec3 velocity = texture2D(gravTex, vUv).xyz * 2.0 - 1.0;
+		velocity *= degradation;
+
+		if(mouseDown == 0)
+		{
+			gl_FragColor = vec4((velocity + 1.0) * 0.5, 1.0);
+			return;
+		}
+
+		vec3 position = posData.xyz * simulationSize;
+		vec3 dir = (gravPos - position);
+		float d = length(dir);
+
+		if(d > gravDist)
+		{
+			gl_FragColor = vec4((velocity + 1.0) * 0.5, 1.0);
+			return;
+		}
+
+		// This function evaluates to 1 at 0 and smoothly falls off to ~0 by about 0.4, which means that the 
+		// gravity will only meaningfully affect about 40% of the garvDist specified.
+		float strength = clamp(exp(-90.0 * pow(d/gravDist, 3.0)), 0.0, 1.0);
+		float speed = length(velocity) * gravSpeed + strength * gravForce * dt;
+
+		vec3 g = normalize(velocity + normalize(dir)) * clamp((speed/gravSpeed), 0.0, 1.0);
+		g = (g + 1.0) * 0.5;
+
+		gl_FragColor = vec4(g, 1.0);
+	}
+
+</script>
+<script type='x-shader/x-fragment' id='velFragment'>
+	
+	// ----------------------------------------------------------------------------------------------
+	// I did not write this awesome 4D simplex noise algorithm. All credit goes to the author below.
+	// ----------------------------------------------------------------------------------------------
+	//
+	// Description : Array and textureless GLSL 2D/3D/4D simplex 
+	//               noise functions.
+	//      Author : Ian McEwan, Ashima Arts.
+	//  Maintainer : ijm
+	//     Lastmod : 20110822 (ijm)
+	//     License : Copyright (C) 2011 Ashima Arts. All rights reserved.
+	//               Distributed under the MIT License. See LICENSE file.
+	//               https://github.com/ashima/webgl-noise
+	// 
+	vec4 mod289(vec4 x) {
+	  return x - floor(x * (1.0 / 289.0)) * 289.0; }
+
+	float mod289(float x) {
+	  return x - floor(x * (1.0 / 289.0)) * 289.0; }
+
+	vec4 permute(vec4 x) {
+	     return mod289(((x*34.0)+1.0)*x);
+	}
+
+	float permute(float x) {
+	     return mod289(((x*34.0)+1.0)*x);
+	}
+
+	vec4 taylorInvSqrt(vec4 r)
+	{
+	  return 1.79284291400159 - 0.85373472095314 * r;
+	}
+
+	float taylorInvSqrt(float r)
+	{
+	  return 1.79284291400159 - 0.85373472095314 * r;
+	}
+
+	vec4 grad4(float j, vec4 ip)
+	{
+		const vec4 ones = vec4(1.0, 1.0, 1.0, -1.0);
+		vec4 p,s;
+
+		p.xyz = floor( fract (vec3(j) * ip.xyz) * 7.0) * ip.z - 1.0;
+		p.w = 1.5 - dot(abs(p.xyz), ones.xyz);
+		s = vec4(lessThan(p, vec4(0.0)));
+		p.xyz = p.xyz + (s.xyz*2.0 - 1.0) * s.www; 
+
+		return p;
+	}
+						
+	// (sqrt(5) - 1)/4 = F4, used once below
+	#define F4 0.309016994374947451
+
+	float snoise(vec4 v)
+	{
+		const vec4  C = vec4( 0.138196601125011,  // (5 - sqrt(5))/20  G4
+		                    0.276393202250021,  // 2 * G4
+		                    0.414589803375032,  // 3 * G4
+		                   -0.447213595499958); // -1 + 4 * G4
+
+		// First corner
+		vec4 i  = floor(v + dot(v, vec4(F4)) );
+		vec4 x0 = v -   i + dot(i, C.xxxx);
+
+		// Other corners
+
+		// Rank sorting originally contributed by Bill Licea-Kane, AMD (formerly ATI)
+		vec4 i0;
+		vec3 isX = step( x0.yzw, x0.xxx );
+		vec3 isYZ = step( x0.zww, x0.yyz );
+		//  i0.x = dot( isX, vec3( 1.0 ) );
+		i0.x = isX.x + isX.y + isX.z;
+		i0.yzw = 1.0 - isX;
+		//  i0.y += dot( isYZ.xy, vec2( 1.0 ) );
+		i0.y += isYZ.x + isYZ.y;
+		i0.zw += 1.0 - isYZ.xy;
+		i0.z += isYZ.z;
+		i0.w += 1.0 - isYZ.z;
+
+		// i0 now contains the unique values 0,1,2,3 in each channel
+		vec4 i3 = clamp( i0, 0.0, 1.0 );
+		vec4 i2 = clamp( i0-1.0, 0.0, 1.0 );
+		vec4 i1 = clamp( i0-2.0, 0.0, 1.0 );
+
+		vec4 x1 = x0 - i1 + C.xxxx;
+		vec4 x2 = x0 - i2 + C.yyyy;
+		vec4 x3 = x0 - i3 + C.zzzz;
+		vec4 x4 = x0 + C.wwww;
+
+		// Permutations
+		i = mod289(i); 
+		float j0 = permute( permute( permute( permute(i.w) + i.z) + i.y) + i.x);
+		vec4 j1 = permute( permute( permute( permute (
+		         i.w + vec4(i1.w, i2.w, i3.w, 1.0 ))
+		       + i.z + vec4(i1.z, i2.z, i3.z, 1.0 ))
+		       + i.y + vec4(i1.y, i2.y, i3.y, 1.0 ))
+		       + i.x + vec4(i1.x, i2.x, i3.x, 1.0 ));
+
+		// Gradients: 7x7x6 points over a cube, mapped onto a 4-cross polytope
+		// 7*7*6 = 294, which is close to the ring size 17*17 = 289.
+		vec4 ip = vec4(1.0/294.0, 1.0/49.0, 1.0/7.0, 0.0) ;
+
+		vec4 p0 = grad4(j0,   ip);
+		vec4 p1 = grad4(j1.x, ip);
+		vec4 p2 = grad4(j1.y, ip);
+		vec4 p3 = grad4(j1.z, ip);
+		vec4 p4 = grad4(j1.w, ip);
+
+		// Normalise gradients
+		vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2, p2), dot(p3,p3)));
+		p0 *= norm.x;
+		p1 *= norm.y;
+		p2 *= norm.z;
+		p3 *= norm.w;
+		p4 *= taylorInvSqrt(dot(p4,p4));
+
+		// Mix contributions from the five corners
+		vec3 m0 = max(0.6 - vec3(dot(x0,x0), dot(x1,x1), dot(x2,x2)), 0.0);
+		vec2 m1 = max(0.6 - vec2(dot(x3,x3), dot(x4,x4)            ), 0.0);
+		m0 = m0 * m0;
+		m1 = m1 * m1;
+		return 49.0 * ( dot(m0*m0, vec3( dot( p0, x0 ), dot( p1, x1 ), dot( p2, x2 )))
+		           + dot(m1*m1, vec2( dot( p3, x3 ), dot( p4, x4 ) ) ) ) ;
+
+	}
+	// ----------------------------------------------------------------------------------------------
+	// Here's where my code starts
+	// ----------------------------------------------------------------------------------------------
+
+	varying vec2 vUv;
+
+	uniform sampler2D velTex;
+	uniform sampler2D posTex;
+	uniform sampler2D origTex;
+	uniform float lifetime;
+	uniform float timer;
+	uniform float dt;
+	uniform float simulationSize;
+	uniform float scale;
+	uniform float strength;
+	uniform float timeScale;
+
+	void main()
+	{
+		//vec3 position = (texture2D(posTex, vUv).xyz * 2.0 - 1.0) * simulationSize;
+		vec3 position = texture2D(posTex, vUv).xyz * simulationSize;
+		vec4 pdata = texture2D(velTex, vUv);
+		vec3 velocity = (pdata.xyz * 2.0) - 1.0;
+		float t = pdata.w * lifetime;
+
+		t += dt;
+
+		if(t > lifetime)
+		{
+			velocity = texture2D(origTex, vUv).xyz;
+			gl_FragColor = vec4(velocity, 0.0);
+			return;
+		}
+
+		float xv = (position.x * 1.0) * scale;
+		float yv = (position.y * 2.0) * scale;
+		float zv = (position.z * 3.0) * scale;
+		float x = snoise(vec4(xv, yv, zv, timer * timeScale));
+		float y = snoise(vec4(yv, xv, zv, timer * timeScale));
+		float z = snoise(vec4(zv, xv, yv, timer * timeScale));
+		
+		velocity += normalize(vec3(x, y, z)) * strength * dt;
+		velocity = normalize(velocity);
+		velocity = (velocity + 1.0) * 0.5;
+		t /= lifetime;
+
+		gl_FragColor = vec4(velocity, t);
+	}
+
+</script>
+<script>
+window.addEventListener('load', init);
+
+// Viewport/Key Global Variables
+var width = 1200;
+var height = 720;
+var pcount = 512;
+var simSize = 50.0;
+
+// THREE.JS/DAT.GUI Global Objects
+var scene; 
+var camera; 
+var renderer;
+var gui;
+
+// Simulation Control Variables
+var controls = {};
+
+// Particle vars
+controls.lifetime = 20.0;
+controls.size = 1.0;
+controls.dtScale = 1.0;
+controls.emission = 0;
+controls.containment = 0;
+
+// Turbulence vars
+controls.noiseSpeed = 3.0;
+controls.noiseScale = 0.035;
+controls.noiseStrength = 2.0;
+controls.noiseTimeScale = 1.0;
+
+// Gravity vars
+controls.gravDist = simSize * 2;
+controls.gravForce = 15;
+controls.gravSpeed = 10;
+
+// Camera vars
+controls.cameraDist = 150;
+controls.cameraRotation = 0;
+controls.orbitSpeed = 25;
+controls.orbitDirection = 0;
+controls.orbit = false;
+
+// Effects vars
+controls.glowKernel = 3;
+controls.glowStrength = 0.5;
+controls.glowScale = 0.5;
+controls.addGlow = false;
+controls.additiveBlending = true;
+
+// Mouse control vars
+var mouseDown = 0;
+var gravPos = new THREE.Vector3(0, 0, 0);
+
+function init()
+{
+// -------------------------------------------------------
+// GENERAL SETUP
+// -------------------------------------------------------
+	renderer = new THREE.WebGLRenderer();
+	renderer.setSize(width, height);
+	document.getElementById('holder').appendChild(renderer.domElement);
+
+	scene = new THREE.Scene();
+	camera = new THREE.PerspectiveCamera(45, width/height, 1, 1001);
+	camera.position.z = controls.cameraDist;
+	camera.lookAt(new THREE.Vector3(0, 0, 0));
+	scene.add(camera);
+
+// -------------------------------------------------------
+// DAT.GUI CONTROLS SETUP
+// -------------------------------------------------------
+	gui = new dat.GUI();
+
+	var pgui = gui.addFolder('Particles');
+	pgui.add(controls, 'lifetime', 10, 60);
+	pgui.add(controls, 'size', 1.0, 3.0);
+	pgui.add(controls, 'dtScale', 0.0, 3.0);
+	pgui.add(controls, 'containment', {'None': 0, 'Cube': 1, 'Sphere': 2});
+
+	var curEmission = controls.emission;
+	var emissionModeNeedsUpdate = false;
+	var emission = pgui.add(controls, 'emission', {'Burst': 0, 'Continuous': 1});
+	emission.onChange(function(value)
+	{
+		if(value != curEmission)
+		{
+			// Set a flag to update the emission mode next animation frame
+			emissionModeNeedsUpdate = true;
+			curEmission = value;
+		}
+	});
+
+	var tgui = gui.addFolder('Turblence');
+	//tgui.add(controls, 'noiseSpeed', 1.0, 5.0);
+	tgui.add(controls, 'noiseScale', 0.01, 0.1);
+	tgui.add(controls, 'noiseStrength', 0.2, 3.0);
+	tgui.add(controls, 'noiseTimeScale', 0.0, 3.0);
+
+	var ggui = gui.addFolder('Mouse Gravity');
+	ggui.add(controls, 'gravDist', simSize, simSize * 3);
+	//ggui.add(controls, 'gravForce', 5, 30);
+	ggui.add(controls, 'gravSpeed', 1, 20);
+
+	var cgui = gui.addFolder('Camera');
+	cgui.add(controls, 'cameraDist', 50, 300);
+	cgui.add(controls, 'cameraRotation', 0, 360).listen(); // Make sure this slider updates automatically while we are orbiting
+	cgui.add(controls, 'orbit');
+	cgui.add(controls, 'orbitSpeed', 15, 50);
+	cgui.add(controls, 'orbitDirection', {'Clockwise': 0, 'Counter-Clockwise': 1});
+	
+	var bgui = gui.addFolder('Effects');
+	bgui.add(controls, 'glowKernel', 1.0, 5.0);
+	bgui.add(controls, 'glowStrength', 0.0, 1.0);
+	bgui.add(controls, 'glowScale', 0.0, 1.0);
+	bgui.add(controls, 'addGlow');
+	bgui.add(controls, 'additiveBlending');
+
+// -------------------------------------------------------
+// PARTICLE DATA INIT
+// -------------------------------------------------------
+	function range(a, b)
+	{
+		return a + (b - a) * Math.random();
+	};
+
+	function compress(n)
+	{
+		return (n + 1) / 2;
+	};
+
+	var bufferSize = pcount * pcount * 4; 
+	var pInitData = new Float32Array(bufferSize);	// position values
+	var vInitData = new Float32Array(bufferSize);	// burst velocities/times
+	var cInitData = new Float32Array(bufferSize);	// continuous velocities/times
+	var gInitData = new Float32Array(bufferSize);	// gravity values
+	for(var i = 0; i < pInitData.length; i += 4)
+	{
+		var x = range(-0.01, 0.01);
+		var y = range(-0.01, 0.01);
+		var z = range(-0.01, 0.01);
+		var t = Math.random();
+		pInitData[i    ] = compress(x); // X	 	
+		pInitData[i + 1] = compress(y); // Y
+		pInitData[i + 2] = compress(z); // Z
+		pInitData[i + 3] = 0; 			// Time
+
+		var p = x + y + z;
+		vInitData[i    ] = compress(x/p);
+		vInitData[i + 1] = compress(y/p);
+		vInitData[i + 2] = compress(z/p);
+		vInitData[i + 3] = 0;
+
+		cInitData[i    ] = compress(x/p);
+		cInitData[i + 1] = compress(y/p);
+		cInitData[i + 2] = compress(z/p);
+		cInitData[i + 3] = t;
+
+		gInitData[i    ] = 0.5;
+		gInitData[i + 1] = 0.5;
+		gInitData[i + 2] = 0.5;
+		gInitData[i + 3] = 1.0;
+	}
+
+	var pOriginTex = new THREE.DataTexture(pInitData, pcount, pcount, THREE.RGBAFormat, THREE.FloatType);
+	pOriginTex.minFilter = THREE.NearestFilter;
+	pOriginTex.magFilter = THREE.NearestFilter;
+	pOriginTex.needsUpdate = true;
+
+	var vOriginTex = new THREE.DataTexture(vInitData, pcount, pcount, THREE.RGBAFormat, THREE.FloatType);
+	vOriginTex.minFilter = THREE.NearestFilter;
+	vOriginTex.magFilter = THREE.NearestFilter;
+	vOriginTex.needsUpdate = true;
+
+	var cOriginTex = new THREE.DataTexture(cInitData, pcount, pcount, THREE.RGBAFormat, THREE.FloatType);
+	cOriginTex.minFilter = THREE.NearestFilter;
+	cOriginTex.magFilter = THREE.NearestFilter;
+	cOriginTex.needsUpdate = true;
+
+	var gOriginTex = new THREE.DataTexture(gInitData, pcount, pcount, THREE.RGBAFormat, THREE.FloatType);
+	gOriginTex.minFilter = THREE.NearestFilter;
+	gOriginTex.magFilter = THREE.NearestFilter;
+	gOriginTex.needsUpdate = true;
+
+	var particles = new THREE.Geometry();
+	var length = pcount * pcount;
+	for(var i = 0; i < length; i++)
+	{
+		var v = new THREE.Vector3();
+		v.x = (i % pcount) / pcount;
+		v.y = Math.floor(i/pcount) / pcount;
+		particles.vertices.push(v);
+	}
+
+	var pMaterial = new THREE.ShaderMaterial( {
+		uniforms: {
+			posTex: 		{type: 't', value: null},
+			psize: 			{type: 'f', value: controls.size},
+			simulationSize: {type: 'f', value: simSize}
+		},
+		vertexShader: document.getElementById('pVertex').textContent,
+		fragmentShader: document.getElementById('pFragment').textContent,
+		depthTest: false,
+		transparent: true,
+		blending: THREE.AdditiveBlending
+	});
+
+	var pMesh = new THREE.PointCloud(particles, pMaterial);
+	scene.add(pMesh);
+
+// -------------------------------------------------------
+// VELOCITY/POSITION BUFFER INIT
+// -------------------------------------------------------
+	
+	// velocity buffer setup
+	var velMaterial = new THREE.ShaderMaterial({
+		uniforms: {
+			velTex:   		{type: 't', value: vOriginTex},
+			posTex: 		{type: 't', value: pOriginTex},
+			origTex: 		{type: 't', value: vOriginTex},
+			lifetime: 		{type: 'f', value: controls.lifetime},
+			timer: 			{type: 'f', value: 0.0},
+			dt: 			{type: 'f', value: 0.0},
+			simulationSize: {type: 'f', value: simSize},
+			scale: 			{type: 'f', value: controls.noiseScale},
+			strength: 		{type: 'f', value: controls.noiseStrength},
+			timeScale: 		{type: 'f', value: controls.noiseTimeScale}
+		},
+		vertexShader: document.getElementById('simVertex').textContent,
+		fragmentShader: document.getElementById('velFragment').textContent
+	});
+	var vdb = new DoubleBuffer(renderer, pcount, pcount, THREE.RGBAFormat, THREE.FloatType, velMaterial, 'velTex');
+	vdb.render(vOriginTex, vdb.front);
+	
+	// position buffer setup
+	var posMaterial = new THREE.ShaderMaterial({
+		uniforms: {
+			posTex: 		{type: 't', value: pOriginTex},
+			velTex: 		{type: 't', value: vOriginTex},
+			gravTex: 		{type: 't', value: null},
+			origTex: 		{type: 't', value: pOriginTex},
+			dt: 			{type: 'f', value: 0.0},
+			simulationSize: {type: 'f', value: simSize},
+			speed: 			{type: 'f', value: controls.noiseSpeed},
+			gravSpeed: 		{type: 'f', value: controls.gravSpeed},
+			containment: 	{type: 'i', value: controls.containment}
+		},
+		vertexShader: document.getElementById('simVertex').textContent,
+		fragmentShader: document.getElementById('posFragment').textContent
+	});
+	var pdb = new DoubleBuffer(renderer, pcount, pcount, THREE.RGBAFormat, THREE.FloatType, posMaterial, 'posTex');
+	pdb.render(pOriginTex, pdb.front);
+
+// -------------------------------------------------------
+// TOUCH GRAVITY INIT
+// -------------------------------------------------------
+	var gravMaterial = new THREE.ShaderMaterial({
+		uniforms: {
+			gravTex: 		{type: 't', value: gOriginTex},
+			posTex: 		{type: 't', value: pOriginTex},
+			dt: 			{type: 'f', value: 0.0},
+			simulationSize: {type: 'f', value: simSize},
+			degradation: 	{type: 'f', value: 0.99},
+			mouseDown: 		{type: 'i', value: mouseDown},
+			gravPos: 		{type: 'v3', value: gravPos},
+			gravDist:       {type: 'f', value: controls.gravDist},
+			gravForce: 		{type: 'f', value: controls.gravForce},
+			gravSpeed:  	{type: 'f', value: controls.gravSpeed}
+		},
+		vertexShader: document.getElementById('simVertex').textContent,
+		fragmentShader: document.getElementById('gravFragment').textContent
+	});
+	var gdb = new DoubleBuffer(renderer, pcount, pcount, THREE.RGBAFormat, THREE.FloatType, gravMaterial, 'gravTex');
+	gdb.render(gOriginTex, gdb.front);
+
+	var aspect = width/height;
+	function calcWorldSpaceMousePos(e)
+	{
+		var offset = $(renderer.domElement).offset();
+		var x = ((e.pageX - offset.left)/width * 2 - 1) * aspect;
+		var y = ((1 - (e.pageY - offset.top)/height) * 2 - 1);
+		var p = new THREE.Vector3(x, y, 0);
+
+		//console.log(p.x, p.y, p.z);
+		
+		var t = Math.tan((Math.PI *.25)/2.0) * controls.cameraDist;
+		p.x = p.x * t;
+		p.y = p.y * t;
+
+		p.applyMatrix4(camera.matrixWorld);
+		p.sub(camera.position);
+		
+		//console.log(p.x, p.y, p.z, p.w);
+		//console.log("-----------------------------------------------");
+		// We are simulating gravity in a space of 0 to simSize, not -simSize to simSize
+		p = (new THREE.Vector3((p.x + simSize)/2, (p.y + simSize)/2, (p.z + simSize)/2));
+		
+		return p;
+	};
+
+	renderer.domElement.addEventListener('mousedown', function(e)
+	{
+		mouseDown = 1;
+		gravPos = calcWorldSpaceMousePos(e);
+	});
+
+	window.addEventListener('mouseup', function(e)
+	{
+		mouseDown = 0;
+	});
+
+	renderer.domElement.addEventListener('mousemove', function(e)
+	{
+		if(!mouseDown)
+			return;
+
+		gravPos = calcWorldSpaceMousePos(e);
+	})
+
+
+	// Doing the blur rendering setup here too because why not
+	var bc = new BlurComposer(renderer, pcount, pcount);
+	var sceneBuffer = new THREE.WebGLRenderTarget(width, height, {
+		wrapS: THREE.ClampToEdgeWrapping,
+		wrapT: THREE.ClampToEdgeWrapping,
+		minFilter: THREE.LinearFilter,
+		magFilter: THREE.LinearFilter,
+		format: THREE.RGBFormat,
+		type: THREE.FloatType,
+		stencilBuffer: false
+	});
+
+// -------------------------------------------------------
+// SIMULATION LOGIC
+// -------------------------------------------------------
+ 	function updateCamera(dt)
+ 	{
+ 		if(controls.orbit == true)
+ 		{
+ 			var dir = controls.orbitDirection == 0 ? 1 : -1;
+ 			controls.cameraRotation = (controls.cameraRotation + dir * controls.orbitSpeed * dt) % 360;
+ 		}
+
+ 		var a = controls.cameraRotation/180 * Math.PI;
+ 		var camx = Math.sin(a) * controls.cameraDist;
+ 		var camz = Math.cos(a) * controls.cameraDist;
+ 		camera.position.x = camx;
+ 		camera.position.z = camz;
+ 		camera.lookAt(new THREE.Vector3(0, 0, 0));
+ 	};
+
+	var prevTime = (new Date()).getTime();
+	var fpsbox = document.getElementById('fps');
+	var elapsedFrames = 0;
+	var elapsedTime = 0;
+	function simulate()
+	{
+		// calc/set time values
+		var time = (new Date()).getTime();
+		var dt = (time - prevTime) * 0.001;
+		prevTime = time;
+
+		++elapsedFrames;
+		elapsedTime += dt;
+		if(elapsedTime > 1)
+		{
+			console.log(elapsedTime, elapsedFrames);
+			fpsbox.innerHTML = '' + Math.floor(elapsedFrames/elapsedTime) + ' FPS';
+			elapsedFrames = elapsedTime = 0;
+		}
+
+		dt *= controls.dtScale;
+
+		// Update the camera's position to reflect changes in the controls
+		updateCamera(dt);
+
+		// Make sure all of the control uniforms are properly updated
+		pMaterial.uniforms.psize.value = controls.size;
+		velMaterial.uniforms.lifetime.value = controls.lifetime;
+		velMaterial.uniforms.scale.value = controls.noiseScale;
+		velMaterial.uniforms.strength.value = controls.noiseStrength;
+		velMaterial.uniforms.timeScale.value = controls.noiseTimeScale;
+		posMaterial.uniforms.speed.value = controls.noiseSpeed;
+		posMaterial.uniforms.gravSpeed.value = controls.gravSpeed;
+		posMaterial.uniforms.containment.value = controls.containment;
+		gravMaterial.uniforms.mouseDown.value = mouseDown;
+		gravMaterial.uniforms.gravPos.value = gravPos;
+		gravMaterial.uniforms.gravDist.value = controls.gravDist;
+		gravMaterial.uniforms.gravForce.value = controls.gravForce;
+		gravMaterial.uniforms.gravSpeed.value = controls.gravSpeed;
+
+		// If the emission mode changed, we need to clear the velocity and positions buffers
+		// to a new initial state before proceeding.
+		if(emissionModeNeedsUpdate === true)
+		{
+			velMaterial.uniforms.dt.value = 0;
+			vdb.render(curEmission == 0 ? vOriginTex : cOriginTex, vdb.front);
+			pdb.render(pOriginTex, pdb.front);
+
+			emissionModeNeedsUpdate = false;
+		}
+
+		// update gravity
+		gravMaterial.uniforms.dt.value = dt;
+		gravMaterial.uniforms.posTex.value = pdb.front;
+
+		gdb.swap();
+		gdb.render(gdb.back, gdb.front);
+
+		// update velocity
+		velMaterial.uniforms.dt.value = dt;
+		velMaterial.uniforms.timer.value += dt;
+		velMaterial.uniforms.posTex.value = pdb.front;
+
+		vdb.swap();
+		vdb.render(vdb.back, vdb.front);
+
+		// update positions using new velocities
+		posMaterial.uniforms.dt.value = dt;
+		posMaterial.uniforms.velTex.value = vdb.front;
+		posMaterial.uniforms.gravTex.value = gdb.front;
+
+		pdb.swap();
+		pdb.render(pdb.back, pdb.front);
+		
+		
+		// render particles using updated positions
+		pMaterial.uniforms.posTex.value = pdb.front;
+		pMaterial.blending = controls.additiveBlending ? THREE.AdditiveBlending : THREE.NormalBlending;
+		if(controls.addGlow)
+		{
+			bc.material.uniforms.kernelSize.value = controls.glowKernel;
+			bc.material.uniforms.blurStrength.value = controls.glowStrength;
+			bc.material.uniforms.blurScale.value = controls.glowScale;
+			renderer.render(scene, camera, sceneBuffer, false);
+			bc.render(sceneBuffer, null);
+		}
+		else
+		{
+			renderer.render(scene, camera);
+		}
+		
+		//renderer.render(vdb.scene, vdb.camera);
+
+		requestAnimationFrame(simulate);
+	}
+
+	requestAnimationFrame(simulate);
+	//renderer.render(scene, camera);
+
+	console.log("done!");
+};
+
+function DoubleBuffer(renderer, w, h, format, type, material, texUniformName)
+{
+	var _this = this;
+
+	_this.front = new THREE.WebGLRenderTarget(w, h, {
+		wrapS: THREE.RepeatWrapping,
+		wrapT: THREE.RepeatWrapping,
+		minFilter: THREE.NearestFilter,
+		magFilter: THREE.NearestFilter,
+		format: format,
+		type: type,
+		stencilBuffer: false
+	});
+	_this.back = _this.front.clone();
+
+	var scene  = new THREE.Scene();
+	var camera = new THREE.OrthographicCamera(-w/2, w/2, h/2, -h/2, -999999, 999999);
+	var mesh   = new THREE.Mesh(new THREE.PlaneBufferGeometry(w, h, 1, 1), material);
+
+	scene.add(camera);
+	scene.add(mesh);
+
+	_this.render = function(source, target)
+	{
+		material.uniforms[texUniformName].value = source;
+		renderer.render(scene, camera, target, false);
+	};
+
+	_this.swap = function()
+	{
+		var temp = _this.front;
+		_this.front = _this.back;
+		_this.back = temp;
+	};
+
+	// Just for debugging
+	_this.scene = scene;
+	_this.camera = camera;
+};
+
+function BlurComposer(renderer, w, h)
+{
+	var _this = this;
+
+	_this.blurBuffer = new THREE.WebGLRenderTarget(w, h, {
+		wrapS: THREE.ClampToEdgeWrapping,
+		wrapT: THREE.ClampToEdgeWrapping,
+		minFilter: THREE.LinearFilter,
+		magFilter: THREE.LinearFilter,
+		format: THREE.RGBFormat,
+		type: THREE.FloatType,
+		stencilBuffer: false
+	});
+
+	var scene  = new THREE.Scene();
+	var camera = new THREE.OrthographicCamera(-w/2, w/2, h/2, -h/2, -999999, 999999);
+
+	var material = new THREE.ShaderMaterial({
+		uniforms: {
+			tex: 			{type: 't', value: null},
+			size: 			{type: 'v2', value: new THREE.Vector2(1/w, 1/h)},
+			kernelSize: 	{type: 'f', value: controls.glowKernel},
+			blurStrength: 	{type: 'f', value: controls.glowStrength},
+			blurScale: 		{type: 'f', value: controls.glowScale},
+			direction: 		{type: 'i', value: 0}
+		},
+		vertexShader: document.getElementById('simVertex').textContent,
+		fragmentShader: document.getElementById('blur').textContent
+	});
+	var mesh   = new THREE.Mesh(new THREE.PlaneBufferGeometry(w, h, 1, 1), material);
+
+	scene.add(camera);
+	scene.add(mesh);
+
+	_this.render = function(source, target)
+	{
+		material.uniforms.tex.value = source;
+		material.uniforms.direction.value = 0;
+		renderer.render(scene, camera, _this.blurBuffer)
+
+		material.uniforms.tex.value = _this.blurBuffer;
+		material.uniforms.direction.value = 1;
+		renderer.render(scene, camera, target, false);
+	};
+
+	_this.scene = scene;
+	_this.camera = camera;
+	_this.material = material;
+};
+</script>
+</head>
+<body>
+<div id='holder' class='canvas-holder'>
+	<div id='fps'></div>
+</div>
+</body>
+</html>
